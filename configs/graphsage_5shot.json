@@ -1,0 +1,23 @@
+{
+  "experiment_name": "graphsage_v1",
+  "n_way": 5,
+  "k_shot": 5,
+  "train_queries_per_class": 1,
+  "eval_queries_per_class": 15,
+  "num_epochs": 10,
+  "train_episodes_per_epoch": 100,
+  "validation_episodes_per_epoch": 20,
+  "final_validation_episodes": 100,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0001,
+  "graph_microbatch_size": 2,
+  "early_stopping_patience": 3,
+  "top_k": 10,
+  "input_dim": 387,
+  "hidden_dim": 256,
+  "num_layers": 2,
+  "dropout": 0.1,
+  "temperature": 0.1,
+  "train_seed": 42,
+  "val_seed": 10000
+}

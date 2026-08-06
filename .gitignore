@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.venv/
+
+# Large persistent artifacts belong in Google Drive, not Git.
+data/
+features/
+checkpoints/
+results/
+*.pt
+*.zip
