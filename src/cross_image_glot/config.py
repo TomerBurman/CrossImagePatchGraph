@@ -11,8 +11,8 @@ EXPECTED_CLASSES = {"train": 64, "val": 16, "test": 20}
 class ProjectPaths:
     """Persistent Drive paths and fast local Colab paths."""
 
-    drive_root: Path = Path("/content/drive/MyDrive/CrossImageGLOT")
-    local_root: Path = Path("/content/CrossImageGLOT_runtime")
+    drive_root: Path = Path("/content/drive/MyDrive/CrossImagePatchGraph")
+    local_root: Path = Path("/content/CrossImagePatchGraph")
     feature_cache_name: str = "dinov2_vits14_224"
 
     @property
