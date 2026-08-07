@@ -12,7 +12,7 @@ class ProjectPaths:
     """Persistent Drive paths and fast local Colab paths."""
 
     drive_root: Path = Path("/content/drive/MyDrive/CrossImagePatchGraph")
-    local_root: Path = Path("/content/CrossImagePatchGraph")
+    local_root: Path = Path("/content/CrossImagePatchGraph_runtime")
     feature_cache_name: str = "dinov2_vits14_224"
 
     @property
