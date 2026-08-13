@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import SAGEConv, global_mean_pool
+from torch_geometric.nn import SAGEConv, global_mean_pool, GATv2Conv
 
 
 @dataclass
@@ -467,57 +467,23 @@ class MeanPrototypeCosineReadout(nn.Module):
 
 
 class CrossImageGraphMatcher(nn.Module):
-    """
-    Complete trainable graph matching module:
-
-        graph
-        → GraphSAGE
-        → image mean pooling
-        → support prototype
-        → cosine score
-    """
-
     def __init__(
         self,
-        input_dim: int = 387,
-        hidden_dim: int = 256,
-        num_layers: int = 2,
-        dropout: float = 0.1,
-        temperature: float = 0.1,
-        learnable_temperature: bool = False,
-    ) -> None:
+        encoder,
+        readout,
+    ):
         super().__init__()
 
-        self.encoder = PatchGraphSAGEEncoder(
-            input_dim=input_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            dropout=dropout,
-        )
+        self.encoder = encoder
+        self.readout = readout
 
-        self.readout = MeanPrototypeCosineReadout(
-            temperature=temperature,
-            learnable_temperature=(
-                learnable_temperature
-            ),
-        )
-
-    def forward(
-        self,
-        graph_batch,
-        return_embeddings: bool = False,
-    ):
-        refined_nodes = self.encoder(
-            graph_batch
-        )
+    def forward(self, graph_batch):
+        refined_nodes = self.encoder(graph_batch)
 
         output = self.readout(
-            refined_nodes=refined_nodes,
-            graph_batch=graph_batch,
+            refined_nodes,
+            graph_batch,
         )
-
-        if return_embeddings:
-            return output
 
         return output.scores
 
@@ -545,3 +511,106 @@ class BaselinePreservingResidualMatcher(nn.Module):
 
     def forward(self, graph_batch, cls_scores: torch.Tensor) -> torch.Tensor:
         return self.combine(cls_scores, self.graph_scores(graph_batch))
+
+
+
+class ResidualGATv2Block(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        heads: int = 4,
+        edge_dim: int = 5,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+
+        if hidden_dim % heads != 0:
+            raise ValueError(
+                "hidden_dim must be divisible by heads."
+            )
+
+        head_dim = hidden_dim // heads
+
+        self.conv = GATv2Conv(
+            in_channels=hidden_dim,
+            out_channels=head_dim,
+            heads=heads,
+            concat=True,
+            dropout=dropout,
+            edge_dim=edge_dim,
+            add_self_loops=False,
+        )
+
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(
+        self,
+        h,
+        edge_index,
+        edge_attr,
+    ):
+        message = self.conv(
+            h,
+            edge_index,
+            edge_attr=edge_attr,
+        )
+
+        message = self.activation(message)
+        message = self.dropout(message)
+
+        return self.norm(h + message)
+
+class PatchGATv2Encoder(nn.Module):
+    def __init__(
+        self,
+        input_dim=387,
+        hidden_dim=256,
+        num_layers=2,
+        heads=4,
+        edge_dim=5,
+        dropout=0.1,
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+
+        self.input_projection = nn.Linear(
+            input_dim,
+            hidden_dim,
+        )
+
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.input_activation = nn.GELU()
+        self.input_dropout = nn.Dropout(dropout)
+
+        self.layers = nn.ModuleList([
+            ResidualGATv2Block(
+                hidden_dim=hidden_dim,
+                heads=heads,
+                edge_dim=edge_dim,
+                dropout=dropout,
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, graph):
+        x = graph.x.float()
+        edge_index = graph.edge_index
+        edge_attr = graph.edge_attr.float()
+
+        h = self.input_projection(x)
+        h = self.input_norm(h)
+        h = self.input_activation(h)
+        h = self.input_dropout(h)
+
+        for layer in self.layers:
+            h = layer(
+                h,
+                edge_index,
+                edge_attr,
+            )
+
+        return h
+
