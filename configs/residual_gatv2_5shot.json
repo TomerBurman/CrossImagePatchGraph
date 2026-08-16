@@ -1,10 +1,10 @@
 {
+    "experiment_name": "residual_gatv2_5way5shot",
     "n_way": 5,
     "k_shot": 5,
 
     "input_dim": 387,
     "hidden_dim": 256,
-
     "num_layers": 2,
 
     "attention_heads": 4,
@@ -15,10 +15,14 @@
     "top_k": 10,
 
     "graph_temperature": 0.1,
+    "cls_temperature": 0.1,
+
     "initial_residual_scale": 0.0,
 
     "learning_rate": 0.001,
     "weight_decay": 0.0001,
+
+    "graph_microbatch_size": 2,
 
     "train_queries_per_class": 1,
     "eval_queries_per_class": 15,
