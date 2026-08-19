@@ -614,3 +614,203 @@ class PatchGATv2Encoder(nn.Module):
 
         return h
 
+
+@dataclass
+class PatchMatchReadoutOutput:
+    """One score per candidate graph."""
+    scores: torch.Tensor
+    raw_similarities: torch.Tensor
+
+
+class DinoResidualGraphEncoder(nn.Module):
+    """
+    Preserve the original frozen DINOv2 patch representation and let a graph
+    encoder learn only a residual correction.
+
+    graph.x[:, :dino_dim] must contain the original DINOv2 patch token.
+
+        base_encoder: [nodes, input_dim] -> [nodes, base_output_dim]
+        delta head:   [nodes, base_output_dim] -> [nodes, dino_dim]
+        output:       DINO + beta * delta
+
+    The correction is norm-matched to the original DINO token so beta has a
+    stable interpretation. beta=0.05 starts at roughly a 5% correction.
+    """
+
+    def __init__(
+        self,
+        base_encoder: nn.Module,
+        base_output_dim: int,
+        dino_dim: int = 384,
+        initial_patch_residual_scale: float = 0.05,
+        norm_match_delta: bool = True,
+    ) -> None:
+        super().__init__()
+        self.base_encoder = base_encoder
+        self.base_output_dim = base_output_dim
+        self.dino_dim = dino_dim
+        self.hidden_dim = dino_dim
+        self.norm_match_delta = norm_match_delta
+
+        self.delta_projection = nn.Linear(base_output_dim, dino_dim)
+        self.patch_residual_scale = nn.Parameter(
+            torch.tensor(float(initial_patch_residual_scale), dtype=torch.float32)
+        )
+
+    def forward(self, graph):
+        if graph.x.shape[-1] < self.dino_dim:
+            raise ValueError(
+                f"graph.x has {graph.x.shape[-1]} features, but dino_dim={self.dino_dim}."
+            )
+
+        original_dino = graph.x[:, : self.dino_dim].to(torch.float32)
+        graph_hidden = self.base_encoder(graph)
+        delta = self.delta_projection(graph_hidden)
+
+        if self.norm_match_delta:
+            delta = F.normalize(delta, p=2, dim=-1)
+            original_norm = (
+                original_dino.norm(p=2, dim=-1, keepdim=True)
+                .detach()
+                .clamp_min(1e-6)
+            )
+            delta = delta * original_norm
+
+        return original_dino + self.patch_residual_scale * delta
+
+
+class MaxMeanPatchReadout(nn.Module):
+    """
+    Patch-to-patch scoring instead of mean-pooling all patches first.
+
+    Default candidate score:
+
+        mean over support images j [
+            mean over query patches i [
+                max over support patches p cosine(q_i, s_{j,p})
+            ]
+        ]
+
+    This preserves local correspondences and gives each support image equal
+    weight. `classwide_max` instead matches each query patch against all support
+    patches of the candidate class jointly.
+    """
+
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        support_reduction: str = "mean_image",
+    ) -> None:
+        super().__init__()
+        if temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        if support_reduction not in {"mean_image", "classwide_max"}:
+            raise ValueError(
+                "support_reduction must be 'mean_image' or 'classwide_max'."
+            )
+        self.temperature = float(temperature)
+        self.support_reduction = support_reduction
+
+    def _single_graph_score(self, nodes, image_ids):
+        query = nodes[image_ids == 0]
+        if query.numel() == 0:
+            raise ValueError("Candidate graph has no query patches.")
+        query = F.normalize(query, p=2, dim=-1)
+
+        support_ids = torch.unique(image_ids[image_ids > 0], sorted=True)
+        if support_ids.numel() == 0:
+            raise ValueError("Candidate graph has no support patches.")
+
+        if self.support_reduction == "classwide_max":
+            support = F.normalize(nodes[image_ids > 0], p=2, dim=-1)
+            similarity = query @ support.T
+            return similarity.max(dim=1).values.mean()
+
+        per_image_scores = []
+        for support_id in support_ids:
+            support = F.normalize(nodes[image_ids == support_id], p=2, dim=-1)
+            similarity = query @ support.T
+            per_image_scores.append(similarity.max(dim=1).values.mean())
+        return torch.stack(per_image_scores).mean()
+
+    def forward(self, refined_nodes: torch.Tensor, graph_batch):
+        if not hasattr(graph_batch, "image_id"):
+            raise AttributeError("graph_batch must contain image_id metadata.")
+
+        image_ids = graph_batch.image_id.reshape(-1).long()
+        if hasattr(graph_batch, "batch"):
+            graph_ids = graph_batch.batch.reshape(-1).long()
+            num_graphs = int(graph_batch.num_graphs)
+        else:
+            graph_ids = torch.zeros(
+                refined_nodes.shape[0], dtype=torch.long, device=refined_nodes.device
+            )
+            num_graphs = 1
+
+        raw_scores = []
+        for graph_id in range(num_graphs):
+            mask = graph_ids == graph_id
+            raw_scores.append(
+                self._single_graph_score(refined_nodes[mask], image_ids[mask])
+            )
+
+        raw_scores = torch.stack(raw_scores)
+        return PatchMatchReadoutOutput(
+            scores=raw_scores / self.temperature,
+            raw_similarities=raw_scores,
+        )
+
+
+@torch.inference_mode()
+def frozen_patch_match_episode(
+    episode: dict,
+    device: torch.device,
+    temperature: float = 0.1,
+    support_reduction: str = "mean_image",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Non-GNN local DINO patch-matching baseline."""
+    support = episode["support_patches"].to(device=device, dtype=torch.float32)
+    query = episode["query_patches"].to(device=device, dtype=torch.float32)
+    labels = episode["query_labels"].to(device=device, dtype=torch.long)
+
+    n_way, k_shot, _, _ = support.shape
+    queries_per_class = query.shape[1]
+    support = F.normalize(support, p=2, dim=-1)
+    query = F.normalize(query, p=2, dim=-1)
+
+    logits_rows = []
+    targets = []
+
+    for query_class_position in range(n_way):
+        for query_position in range(queries_per_class):
+            q = query[query_class_position, query_position]
+            candidate_scores = []
+
+            for candidate_id in range(n_way):
+                candidate_support = support[candidate_id]
+
+                if support_reduction == "classwide_max":
+                    flat_support = candidate_support.reshape(
+                        -1, candidate_support.shape[-1]
+                    )
+                    similarity = q @ flat_support.T
+                    raw_score = similarity.max(dim=1).values.mean()
+                elif support_reduction == "mean_image":
+                    per_image_scores = []
+                    for support_index in range(k_shot):
+                        similarity = q @ candidate_support[support_index].T
+                        per_image_scores.append(
+                            similarity.max(dim=1).values.mean()
+                        )
+                    raw_score = torch.stack(per_image_scores).mean()
+                else:
+                    raise ValueError(
+                        "support_reduction must be 'mean_image' or 'classwide_max'."
+                    )
+
+                candidate_scores.append(raw_score / temperature)
+
+            logits_rows.append(torch.stack(candidate_scores))
+            targets.append(labels[query_class_position, query_position])
+
+    return torch.stack(logits_rows), torch.stack(targets)
