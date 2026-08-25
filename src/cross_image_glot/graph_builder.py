@@ -377,8 +377,7 @@ class ClassConditionedPatchGraphBuilder:
 
         # [P, D] @ [K, D, P] -> [P, K, P]
         # similarity_matrix[i, k, j] = sim between query patch i and support k patch j
-        similarity_matrix = torch.einsum('id,kjd->ikj', normalized_query, normalized_support.transpose(1, 2))
-
+        similarity_matrix = torch.einsum('id,kjd->ikj', normalized_query, normalized_support)
         selected_similarities, selected_local_indices = torch.topk(
             similarity_matrix, k=k_per_image, dim=-1, largest=True, sorted=True
         )
