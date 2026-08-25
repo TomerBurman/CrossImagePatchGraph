@@ -17,5 +17,7 @@
     "train_queries_per_class": 1,
     "eval_queries_per_class": 15,
     "train_seed": 123,
-    "val_seed": 456
+    "val_seed": 456,
+    "validation_episodes_per_epoch": 50,
+    "early_stopping_patience": 5
 }

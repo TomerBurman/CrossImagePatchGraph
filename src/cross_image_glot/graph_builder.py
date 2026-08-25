@@ -358,169 +358,70 @@ class ClassConditionedPatchGraphBuilder:
         self,
         query_patches: torch.Tensor,
         support_patches: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Connect each query patch to its top-k support patches.
-
-        The search is performed across all K support images of
-        the candidate class:
-
-            support: [K, P, D] -> [K*P, D]
-
-        Similarity matrix:
-
-            [P, D] @ [D, K*P] -> [P, K*P]
+        Connect each query patch to its top-k support patches, 
+        balanced evenly across all K support images.
         """
-        query = query_patches.to(
-            device=self.similarity_device,
-            dtype=torch.float32,
+        query = query_patches.to(device=self.similarity_device, dtype=torch.float32)
+        support = support_patches.to(device=self.similarity_device, dtype=torch.float32)
+
+        normalized_query = F.normalize(query, p=2, dim=-1)
+        normalized_support = F.normalize(support, p=2, dim=-1)
+
+        K = support_patches.shape[0]
+        P = self.num_patches
+        
+        # Calculate fair distribution of k per support image
+        k_per_image = max(1, self.top_k // K)
+
+        # [P, D] @ [K, D, P] -> [P, K, P]
+        # similarity_matrix[i, k, j] = sim between query patch i and support k patch j
+        similarity_matrix = torch.einsum('id,kjd->ikj', normalized_query, normalized_support.transpose(1, 2))
+
+        selected_similarities, selected_local_indices = torch.topk(
+            similarity_matrix, k=k_per_image, dim=-1, largest=True, sorted=True
         )
 
-        support = support_patches.reshape(
-            -1,
-            support_patches.shape[-1],
-        ).to(
-            device=self.similarity_device,
-            dtype=torch.float32,
-        )
+        # Expand query nodes to match shape [P, K, k_per_image]
+        query_nodes = torch.arange(P, device=self.similarity_device).view(P, 1, 1).expand(P, K, k_per_image)
 
-        normalized_query = F.normalize(
-            query,
-            p=2,
-            dim=-1,
-        )
+        # Map local support indices back to global graph node IDs
+        # Support image k occupies nodes [P + k*P, P + (k+1)*P)
+        offsets = (torch.arange(K, device=self.similarity_device) * P + P).view(1, K, 1)
+        global_support_nodes = selected_local_indices + offsets
 
-        normalized_support = F.normalize(
-            support,
-            p=2,
-            dim=-1,
-        )
-
-        similarity_matrix = (
-            normalized_query
-            @ normalized_support.T
-        )
-
-        effective_top_k = min(
-            self.top_k,
-            normalized_support.shape[0],
-        )
-
-        selected_similarities, selected_support = (
-            torch.topk(
-                similarity_matrix,
-                k=effective_top_k,
-                dim=-1,
-                largest=True,
-                sorted=True,
-            )
-        )
-
-        query_nodes = torch.arange(
-            self.num_patches,
-            device=self.similarity_device,
-        ).unsqueeze(1).expand_as(selected_support)
+        # Flatten for edge index
+        query_nodes = query_nodes.reshape(-1)
+        global_support_nodes = global_support_nodes.reshape(-1)
+        selected_similarities = selected_similarities.reshape(-1)
 
         if self.min_similarity is not None:
-            keep = (
-                selected_similarities
-                >= self.min_similarity
-            )
-
+            keep = selected_similarities >= self.min_similarity
             query_nodes = query_nodes[keep]
-            selected_support = selected_support[keep]
-            selected_similarities = (
-                selected_similarities[keep]
-            )
-
-        else:
-            query_nodes = query_nodes.reshape(-1)
-            selected_support = (
-                selected_support.reshape(-1)
-            )
-            selected_similarities = (
-                selected_similarities.reshape(-1)
-            )
+            global_support_nodes = global_support_nodes[keep]
+            selected_similarities = selected_similarities[keep]
 
         if selected_similarities.numel() == 0:
-            raise RuntimeError(
-                "No semantic edges survived graph construction. "
-                "Reduce min_similarity or disable the threshold."
-            )
+            raise RuntimeError("No semantic edges survived graph construction. Reduce min_similarity.")
 
-        # Query occupies nodes [0, P).
-        # Flattened support occupies nodes [P, P + K*P).
-        global_support_nodes = (
-            selected_support + self.num_patches
-        )
+        query_to_support = torch.stack([query_nodes, global_support_nodes], dim=0)
+        support_to_query = torch.stack([global_support_nodes, query_nodes], dim=0)
 
-        query_to_support = torch.stack(
-            [
-                query_nodes,
-                global_support_nodes,
-            ],
-            dim=0,
-        )
+        semantic_edge_index = torch.cat([query_to_support, support_to_query], dim=1).cpu()
+        bidirectional_similarities = torch.cat([selected_similarities, selected_similarities], dim=0).cpu()
 
-        support_to_query = torch.stack(
-            [
-                global_support_nodes,
-                query_nodes,
-            ],
-            dim=0,
-        )
-
-        semantic_edge_index = torch.cat(
-            [
-                query_to_support,
-                support_to_query,
-            ],
-            dim=1,
-        ).cpu()
-
-        # Both directions use the same visual similarity.
-        bidirectional_similarities = torch.cat(
-            [
-                selected_similarities,
-                selected_similarities,
-            ],
-            dim=0,
-        ).cpu()
-
-        zeros = torch.zeros_like(
-            bidirectional_similarities
-        )
-
+        zeros = torch.zeros_like(bidirectional_similarities)
         semantic_edge_attributes = torch.stack(
-            [
-                bidirectional_similarities,
-                zeros,
-                torch.ones_like(
-                    bidirectional_similarities
-                ),
-                zeros,
-                zeros,
-            ],
-            dim=-1,
+            [bidirectional_similarities, zeros, torch.ones_like(bidirectional_similarities), zeros, zeros], 
+            dim=-1
         )
 
         semantic_edge_types = torch.full(
-            size=(semantic_edge_index.shape[1],),
-            fill_value=self.SEMANTIC_EDGE,
-            dtype=torch.long,
+            size=(semantic_edge_index.shape[1],), fill_value=self.SEMANTIC_EDGE, dtype=torch.long
         )
 
-        return (
-            semantic_edge_index,
-            semantic_edge_attributes,
-            semantic_edge_types,
-            selected_similarities.detach().cpu(),
-        )
+        return semantic_edge_index, semantic_edge_attributes, semantic_edge_types, selected_similarities.detach().cpu()
 
     def build_graph(
         self,

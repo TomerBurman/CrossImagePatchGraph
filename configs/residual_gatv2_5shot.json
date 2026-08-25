@@ -17,7 +17,7 @@
     "graph_temperature": 0.1,
     "cls_temperature": 0.1,
 
-    "initial_residual_scale": 0.0,
+    "initial_residual_scale": 0.05,
 
     "learning_rate": 0.001,
     "weight_decay": 0.0001,
@@ -28,5 +28,7 @@
     "eval_queries_per_class": 15,
 
     "train_seed": 123,
-    "val_seed": 456
+    "val_seed": 456,
+    "validation_episodes_per_epoch": 50,
+    "early_stopping_patience": 5
 }
